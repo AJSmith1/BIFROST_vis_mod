@@ -1,30 +1,8 @@
 import numpy as np
-from py_pol.stokes import Stokes
 from py_pol.utils import degrees
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
-from mpl_toolkits.mplot3d import Axes3D
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from numpy import (array, asarray, cos, exp, linspace, matrix, meshgrid,
-                   ndarray, ones, outer, real, remainder, sin, size, sqrt,
-                   zeros_like)
-from scipy import datasets
-from scipy.signal import fftconvolve
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
-#Will delete this data later, just for testing purposes. 
-S0 = np.array([1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.])
-S1 = np.array([0.93969262, 0.93969262, 0.93969262, 0.93969262, 0.93969262, 0.93969262,
-               0.93969262, 0.93969262, 0.93969262, 0.93969262, 0.93969262])
-S2 = np.array([-0.29373713, -0.29841252, -0.30283834, -0.30701584, -0.3109464, -0.3146316,
-               -0.31807315, -0.32127293, -0.32423294, -0.32695533, -0.32944238])
-S3 = np.array([0.17520353, 0.16711597, 0.15895508, 0.15072841, 0.14244337, 0.13410718,
-               0.12572689, 0.11730936, 0.10886128, 0.10038918, 0.0918994])
-
-S = Stokes("Source 0"); S.from_matrix(np.stack([S0, S1, S2, S3], axis=1))
-####################################################################################
 
 
 def azel_2_xyz(az, el, pol=1):
@@ -53,7 +31,9 @@ def plot_poincare(*datasets,
                   in_degrees=False, 
                   param_name=None,
                   log=False,
-                  colormap="Blackbody"):
+                  colormap="Blackbody",
+                  n_subplots=1,
+                  datasets_per_subplot=None):
     
     n = len(datasets)
     if not isinstance(param, list):
@@ -62,25 +42,24 @@ def plot_poincare(*datasets,
         param_name = [param_name] * n
     if not isinstance(colormap, list):
         colormap = [colormap] * n
+
+    # How many datasets go in each subplot
+    # e.g. datasets_per_subplot=[1,1] means one dataset per subplot
+    if datasets_per_subplot is None:
+        datasets_per_subplot = [n // n_subplots] * n_subplots
+        # distribute remainder
+        for i in range(n % n_subplots):
+            datasets_per_subplot[i] += 1
     
-    #S = S.copy()
-    #Ndim = S.ndim
-    #Nrows = 1
-    #Ncolumns = 1
-    #if Ndim <= 1:
-         #S.shape = [1, 1, 1, S.size]
-    #else:
-        #S.shape = [1, 1, S.shape[0]] + [np.prod(S.shape[1:])]
-    #Ones = np.ones(S.shape[3])
-    
-    # Reshape param
-    #if param is not None and not isinstance(param, str):
-        #param = np.reshape(param, S.shape)
+     # Build subplot assignment: which subplot does each dataset go into?
+    subplot_assignment = []
+    for subplot_idx, count in enumerate(datasets_per_subplot):
+        subplot_assignment.extend([subplot_idx + 1] * count)  # 1-indexed for Plotly
     
     add_auxiliar = False
     if fig is None: # If no figure is provided, create a new one and add the axes and guides. If a figure is provided, it is assumed that the axes and guides have already been added.
-        specs = [[{'type': 'surface'}]]
-        fig = make_subplots(rows=1, cols=1, specs=specs)
+        specs = [[{'type': 'surface'} for _ in range(n_subplots)]]
+        fig = make_subplots(rows=1, cols=n_subplots, specs=specs, horizontal_spacing=0.05)
         add_auxiliar = True #This variable is used to avoid plotting the axes and guides multiple times when the function is called several times with the same figure.
     lighting = dict(ambient=0.9,
                     diffuse=0.,
@@ -231,11 +210,19 @@ def plot_poincare(*datasets,
         x, y, z = azel_2_xyz(az, el)
         customdata = np.dstack(
             (az / degrees, el / degrees))
-        level = 0.2
+
+    # Add axes, guides, sphere to every subplot
+    for col in range(1, n_subplots + 1):
+        if draw_axes:
+            fig.add_traces([axis_px, axis_mx, axis_py, axis_my, axis_pz, axis_mz],
+                               rows=[1]*6, cols=[col]*6)
+        if draw_guides:
+            fig.add_traces([circle_z, circle_y, circle_x],
+                               rows=[1]*3, cols=[col]*3)
         Psphere = go.Surface(x=x,
                              y=y,
                              z=z,
-                             surfacecolor=np.ones_like(x) * level,
+                             surfacecolor=np.ones_like(x) * 0.2,
                              cmin=0,
                              cmax=1,
                              opacity=0.7,
@@ -246,99 +233,66 @@ def plot_poincare(*datasets,
                              hovertemplate=hovertemplate,
                              name="Sphere",
                              showlegend=False)
+        fig.add_trace(Psphere, row=1, col=col)
+    
+    subplot_colorbar_count = [0] * (n_subplots + 1)
 
     for ds_idx, S in enumerate(datasets):
         S = S.copy()
-        Ndim = S.ndim
-        if Ndim <= 1:
-            S.shape = [1, 1, 1, S.size]
-        else:
-            S.shape = [1, 1, S.shape[0]] + [np.prod(S.shape[1:])]
-        
-        Ones = np.ones(S.shape[3])
+        col = subplot_assignment[ds_idx]
+    
         ds_param = param[ds_idx]
         ds_param_name = param_name[ds_idx] if param_name[ds_idx] is not None else S.name
+        ds_colormap = colormap[ds_idx]
 
-        # Reshape per-dataset param array if provided
-        if ds_param is not None and not isinstance(ds_param, str):
-            ds_param = np.reshape(ds_param, S.shape)
+        # Position within this subplot (0, 1, 2, ...)
+        within_subplot_idx = subplot_colorbar_count[col]
+        subplot_colorbar_count[col] += 1
 
-        for indR, Srow in enumerate(S):
-            for indC, Scol in enumerate(Srow):
-    
-                # Set colorbar once per dataset
-                if isinstance(ds_param, str):
+        x, y, z, az, el = obj_2_xyz(S, in_degrees=True)
+        customdata = np.squeeze(np.dstack((az, el)))
+
+        subplot_width = 1.0 / n_subplots
+        colorbar_x = (col - 1) * subplot_width + subplot_width / 2
+        colorbar_y = -0.1 - within_subplot_idx * 0.15
+
+        if isinstance(ds_param, str):
+                        Scolor = eval("S.parameters." + ds_param + "(out_number=False)")
                         colorbar = dict(
                             title=ds_param,
                             orientation='h',
                             ticklabelposition='outside bottom',
-                            y=-0.1 - ds_idx * 0.15,
-                            x=0.5,
-                            len=0.5
+                            y=colorbar_y,
+                            x=colorbar_x,
+                            len=subplot_width * 0.8,
+                            anchor="center"
                         )
-                elif ds_param is not None:
+        elif ds_param is not None:
+                        Scolor = np.array(ds_param).flatten()
                         colorbar = dict(
                             title=ds_param_name,
                             orientation='h',
                             ticklabelposition='outside bottom',
-                            y=-0.1 - ds_idx * 0.15,
-                            x=0.5,
-                            len=0.5,
+                            y=colorbar_y,
+                            x=colorbar_x,
+                            len=subplot_width * 0.8,
+                            xanchor='center',
                             tickfont=dict(size=15)
                         )
-                else:
-                        colorbar = {}
+        else:
+            n_points = len(x)
+            Scolor = np.ones(n_points) * (ds_idx + 1) / n
+            colorbar = {}
 
-            # Plotting axes
-                if draw_axes and add_auxiliar:
-                        fig.add_traces(
-                            [axis_px, axis_mx, axis_py, axis_my, axis_pz, axis_mz],
-                            rows=1,
-                            cols=1)
-
-            # Plotting curves
-            if draw_guides and add_auxiliar:
-                fig.add_traces([circle_z, circle_y, circle_x],
-                                    rows=1,
-                                    cols=1)
-            if add_auxiliar:
-                fig.add_trace(Psphere, row=indR + 1, col=indC + 1)
-                    
-            # Loop in traces
-            for indT, Strace in enumerate(Scol):
-                    if isinstance(ds_param, str):
-                        Scolor = eval("Strace.parameters." + ds_param +
-                                    "(out_number=False)")
-                    elif ds_param is not None:
-                        Scolor = ds_param[indR, indC, indT, ...]
-                    else:
-                        Scolor = Ones * (indT + 1) / Scol.shape[0]
-                    if ds_param is not None:
-                        if log:
-                            cond = Scolor <= 0
-                            if np.any(cond):
-                                Scolor[cond] = np.inf
-                                Scolor[cond] = np.min(Scolor) / 10
-                            Scolor = np.log10(Scolor)
-                            colorbar["title"] = "log(" + colorbar["title"] + ")"
-                            
-                        elif in_degrees:
-                            Scolor = Scolor / degrees
-                            colorbar["title"] += " (deg)"
-
-                    x, y, z, az, el = obj_2_xyz(Strace, in_degrees=True)
-                    customdata = np.squeeze(np.dstack((az, el)))
-                    ds_colormap = colormap[ds_idx]
-                    marker = dict(size=10, color=Scolor, colorbar=colorbar, colorscale=ds_colormap)
-                    Fdata = go.Scatter3d(x=x,
-                                                y=y,
-                                                z=z,
-                                                marker=marker,
-                                                name=S.name,
-                                                mode="markers",
-                                                customdata=customdata,
-                                                hovertemplate=hovertemplate)
-                    fig.add_trace(Fdata, row=indR + 1, col=indC + 1)
+        marker = dict(size=10, color=Scolor, colorbar=colorbar, colorscale=ds_colormap)
+        Fdata = go.Scatter3d(
+            x=x, y=y, z=z,
+            marker=marker,
+            name=S.name,
+            mode="markers",
+            customdata=customdata,
+            hovertemplate=hovertemplate)
+        fig.add_trace(Fdata, row=1, col=col)
 
     #Plot figure
     axis = dict(showbackground=False,
@@ -349,7 +303,7 @@ def plot_poincare(*datasets,
                   center=dict(x=0, y=0, z=0),
                   eye=dict(x=0.85, y=0.85, z=0.85))
     fig.update_layout(margin=dict(l=20, r=20, t=20, b=20),
-                      width=int(figsize[0] * 100),
+                      width=int(figsize[0] * 100 * n_subplots),
                       height=int(figsize[1] * 100),
                       showlegend=False)
     fig.update_scenes(annotations=annotations,
@@ -363,4 +317,3 @@ def plot_poincare(*datasets,
     return fig
     
     
-#plot_poincare(S, param="azimuth", in_degrees=True, colormap="Viridis")
