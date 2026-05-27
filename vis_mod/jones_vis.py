@@ -4,7 +4,6 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-
 def azel_2_xyz(az, el, pol=1):
     phi = 2*az #NOTE: azimuth is multiplied by 2 to match the Poincare sphere convention
     chi = -2*el + 90*degrees
@@ -13,35 +12,71 @@ def azel_2_xyz(az, el, pol=1):
     z = pol * np.cos(chi)
     return x, y, z
 
-def obj_2_xyz(S, in_degrees=False):
-    az, el = S.parameters.azimuth_ellipticity(out_number=False, use_nan=False)
-    x, y, z = azel_2_xyz(az, el)
-    if in_degrees:
-        ret = [x, y, z, az/degrees, el/degrees]
-    else:
-        ret = [x, y, z, az, el]
-    return ret
+def jones_to_mueller(J):
+    U = np.array([
+        [1,  0,  0,  1],
+        [1,  0,  0, -1],
+        [0,  1,  1,  0],
+        [0, 1j, -1j, 0],
+    ])
+    M = (U @ np.kron(J, J.conj()) @ np.linalg.inv(U)).real
+    return M
 
-def plot_poincare(*datasets, 
-                  fig=None, 
-                  figsize=(6, 6), 
-                  draw_axes=True, 
-                  draw_guides=True, 
-                  param=None, 
-                  in_degrees=False, 
-                  param_name=None,
-                  log=False,
-                  colormap="Blackbody",
-                  n_subplots=1,
-                  datasets_per_subplot=None):
+def mueller_to_axis_angle(M):
+    R = M[1:4, 1:4]  # Stokes sub-block (S1,S2,S3)
+
+    # Rotation angle from trace: tr(R) = 1 + 2*cos(theta)
+    cos_angle = np.clip((np.trace(R) - 1) / 2, -1, 1)
+    angle = np.arccos(cos_angle)
+
+    # Rotation axis from the skew-symmetric part
+    skew = (R - R.T) / 2
+    axis = np.array([skew[2, 1], skew[0, 2], skew[1, 0]])
+    norm = np.linalg.norm(axis)
+    if norm < 1e-10:
+        axis = np.array([1, 0, 0])
+    else:
+        axis /= norm
+    return axis, angle
+
+def rotation_arc(axis, start_vec, angle, n_points=120):
+
+    # Build an orthonormal frame: axis, u (start), v (u × axis)
+    u = start_vec - np.dot(start_vec, axis) * axis
+    u_norm = np.linalg.norm(u)
+    if u_norm < 1e-10:
+        perp = np.array([1, 0, 0]) if abs(axis[0]) < 0.9 else np.array([0, 1, 0])
+        u = perp - np.dot(perp, axis) * axis
+        u /= np.linalg.norm(u)
+    else:
+        u /= u_norm
+    v = np.cross(axis, u)
+
+    ts = np.linspace(0, angle, n_points)
+    arc = np.outer(np.cos(ts), u) + np.outer(np.sin(ts), v)
+    # Project onto the sphere (radius = distance of start_vec from axis)
+    r = np.linalg.norm(start_vec - np.dot(start_vec, axis) * axis)
+    arc *= r
+    arc += np.dot(start_vec, axis) * axis[np.newaxis, :]
+    return arc[:, 0], arc[:, 1], arc[:, 2]
+
+def plot_jones(*datasets, 
+               fig=None, 
+                figsize=(6, 6), 
+                draw_axes=True, 
+                draw_guides=True,
+                n_subplots=1,
+                datasets_per_subplot=None, 
+                axis_color="black",
+                arc_color="crimson",
+                axis_length=1.25,
+                arc_width=5,
+                axis_width=8,
+                n_arrows=3,
+                start_vec=None,
+                show_angle_label=True,):
     
     n = len(datasets)
-    if not isinstance(param, list):
-        param = [param] * n
-    if not isinstance(param_name, list):
-        param_name = [param_name] * n
-    if not isinstance(colormap, list):
-        colormap = [colormap] * n
 
     # How many datasets go in each subplot
     # e.g. datasets_per_subplot=[1,1] means one dataset per subplot
@@ -50,12 +85,12 @@ def plot_poincare(*datasets,
         # distribute remainder
         for i in range(n % n_subplots):
             datasets_per_subplot[i] += 1
-    
-     # Build subplot assignment: which subplot does each dataset go into?
+
+    # Build subplot assignment: which subplot does each dataset go into?
     subplot_assignment = []
     for subplot_idx, count in enumerate(datasets_per_subplot):
         subplot_assignment.extend([subplot_idx + 1] * count)  # 1-indexed for Plotly
-    
+
     add_auxiliar = False
     if fig is None: # If no figure is provided, create a new one and add the axes and guides. If a figure is provided, it is assumed that the axes and guides have already been added.
         specs = [[{'type': 'surface'} for _ in range(n_subplots)]]
@@ -118,7 +153,7 @@ def plot_poincare(*datasets,
                                hoverinfo="skip",
                                name="-S3")
         size = 30
-        annotations = [
+        axis_annotations = [
             dict(showarrow=False,
                  x=1.2,
                  y=0,
@@ -169,7 +204,7 @@ def plot_poincare(*datasets,
                  yshift=-15),
         ]
     else:
-        annotations = []
+        axis_annotations = []
 
     # Defining curves
     if draw_guides and add_auxiliar:
@@ -203,7 +238,7 @@ def plot_poincare(*datasets,
                                 mode="lines",
                                 name="S1=0")
         
-    #Defining sphere    
+        #Defining sphere    
     if add_auxiliar:
         el, az = np.mgrid[-45 * degrees:45 * degrees:100j,
                           0:180 * degrees:100j]
@@ -234,86 +269,103 @@ def plot_poincare(*datasets,
                              name="Sphere",
                              showlegend=False)
         fig.add_trace(Psphere, row=1, col=col)
-    
-    subplot_colorbar_count = [0] * (n_subplots + 1)
 
-    for ds_idx, S in enumerate(datasets):
-        S = S.copy()
+    subplot_angle_annotations = {i+1: [] for i in range(n_subplots)}
+
+    for ds_idx, J in enumerate(datasets):
+        J = J.copy()
         col = subplot_assignment[ds_idx]
+
+        M = jones_to_mueller(J)
+        axis, angle = mueller_to_axis_angle(M)
+
+        ax, ay, az = axis * axis_length
+        axis_trace = go.Scatter3d(
+            x=[-ax, ax], y=[-ay, ay], z=[-az, az],
+            mode="lines",
+            line=dict(color=axis_color, width=axis_width),
+            name="Rotation axis",
+            hoverinfo="skip",
+            )
     
-        ds_param = param[ds_idx]
-        ds_param_name = param_name[ds_idx] if param_name[ds_idx] is not None else S.name
-        ds_colormap = colormap[ds_idx]
+        sv = start_vec   
 
-        # Position within this subplot (0, 1, 2, ...)
-        within_subplot_idx = subplot_colorbar_count[col]
-        subplot_colorbar_count[col] += 1
+        if sv is None:
+            perp = np.array([1, 0, 0]) if abs(axis[0]) < 0.9 else np.array([0, 1, 0])
+            sv = perp - np.dot(perp, axis) * axis
+            sv /= np.linalg.norm(sv)
 
-        x, y, z, az, el = obj_2_xyz(S, in_degrees=True)
-        customdata = np.squeeze(np.dstack((az, el)))
+        x_arc, y_arc, z_arc = rotation_arc(axis, sv, angle)
+
+        # Arc trace
+        arc_trace = go.Scatter3d(
+            x=x_arc, y=y_arc, z=z_arc,
+            mode="lines",
+            line=dict(color=arc_color, width=arc_width),
+            name="Rotation arc (%.1f°)" % (angle / degrees),
+            hoverinfo="name",
+        )
+
+            # Arrow traces
+        arrow_traces = []
+        if n_arrows > 0:
+            indices = np.linspace(10, len(x_arc) - 2, n_arrows, dtype=int)
+            for i in indices:
+                # Tangent direction at this arc point
+                tangent = np.array([
+                    x_arc[i + 1] - x_arc[i - 1],
+                    y_arc[i + 1] - y_arc[i - 1],
+                    z_arc[i + 1] - z_arc[i - 1],
+                ])
+                tangent /= np.linalg.norm(tangent)
+                cone = go.Cone(
+                    x=[x_arc[i]], y=[y_arc[i]], z=[z_arc[i]],
+                    u=[tangent[0]], v=[tangent[1]], w=[tangent[2]],
+                    sizemode="absolute", sizeref=0.12,
+                    colorscale=[[0, arc_color], [1, arc_color]],
+                    showscale=False,
+                    anchor="tip",
+                    hoverinfo="skip",
+                )
+                arrow_traces.append(cone)
+
+        # Angle annotations
+        if show_angle_label:
+            mid = len(x_arc) // 2
+            subplot_angle_annotations[col].append(dict(
+            x=x_arc[mid] * 1.1, y=y_arc[mid] * 1.1, z=z_arc[mid] * 1.1,
+            text="%.1f°" % (angle / degrees),
+            showarrow=False,
+            font=dict(color=arc_color, size=18, family="Times New Roman"),
+        ))
 
         subplot_width = 1.0 / n_subplots
-        colorbar_x = (col - 1) * subplot_width + subplot_width / 2
-        colorbar_y = -0.1 - within_subplot_idx * 0.15
 
-        if isinstance(ds_param, str):
-                        Scolor = eval("S.parameters." + ds_param + "(out_number=False)")
-                        colorbar = dict(
-                            title=ds_param,
-                            orientation='h',
-                            ticklabelposition='outside bottom',
-                            y=colorbar_y,
-                            x=colorbar_x,
-                            len=subplot_width * 0.8,
-                            anchor="center"
-                        )
-        elif ds_param is not None:
-                        Scolor = np.array(ds_param).flatten()
-                        colorbar = dict(
-                            title=ds_param_name,
-                            orientation='h',
-                            ticklabelposition='outside bottom',
-                            y=colorbar_y,
-                            x=colorbar_x,
-                            len=subplot_width * 0.8,
-                            xanchor='center',
-                            tickfont=dict(size=15)
-                        )
-        else:
-            n_points = len(x)
-            Scolor = np.ones(n_points) * (ds_idx + 1) / n
-            colorbar = {}
+        fig.add_trace(axis_trace, row=1, col=col)
+        fig.add_trace(arc_trace, row=1, col=col)
 
-        marker = dict(size=10, color=Scolor, colorbar=colorbar, colorscale=ds_colormap)
-        Fdata = go.Scatter3d(
-            x=x, y=y, z=z,
-            marker=marker,
-            name=S.name,
-            mode="markers",
-            customdata=customdata,
-            hovertemplate=hovertemplate)
-        fig.add_trace(Fdata, row=1, col=col)
+        for t in arrow_traces:
+            fig.add_trace(t, row=1, col=col)
 
     #Plot figure
-    axis = dict(showbackground=False,
-                showgrid=False,
-                zeroline=False,
-                visible=False)
+    axis_dict = dict(showbackground=False, showgrid=False, zeroline=False, visible=False)
     camera = dict(up=dict(x=0, y=0, z=1),
-                  center=dict(x=0, y=0, z=0),
-                  eye=dict(x=0.85, y=0.85, z=0.85))
+                center=dict(x=0, y=0, z=0),
+                eye=dict(x=0.85, y=0.85, z=0.85))
+
     fig.update_layout(margin=dict(l=20, r=20, t=20, b=20),
-                      width=int(figsize[0] * 100 * n_subplots),
-                      height=int(figsize[1] * 100),
-                      showlegend=False)
-    fig.update_scenes(annotations=annotations,
-                      xaxis=axis,
-                      yaxis=axis,
-                      zaxis=axis,
-                      camera=camera)
-    
+                    width=int(figsize[0] * 100 * n_subplots),
+                    height=int(figsize[1] * 100),
+                    showlegend=False)
+
+    for col in range(1, n_subplots + 1):
+        scene_key = "scene" if col == 1 else f"scene{col}"
+        annotations = axis_annotations + subplot_angle_annotations[col]
+        fig.layout[scene_key].annotations = annotations
+        fig.layout[scene_key].xaxis = axis_dict
+        fig.layout[scene_key].yaxis = axis_dict
+        fig.layout[scene_key].zaxis = axis_dict
+        fig.layout[scene_key].camera = camera
 
     fig.show()
     return fig
-    
-    
